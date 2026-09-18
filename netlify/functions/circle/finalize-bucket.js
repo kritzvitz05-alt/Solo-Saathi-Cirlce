@@ -185,25 +185,36 @@ exports.handler = async (event, context) => {
       createdAt: now,
     };
 
-    await db.saveCircleState(circleId, circleState);
+    // 6. Build and persist all documents atomically via Batched Write
+    //    This guarantees no attendee is left in a broken state if the function crashes.
+    const batch = db.runBatch();
 
-    // 7. Update Registration Records for all matched attendees
+    // 6a. Create circle document
+    const circleRef = db.getDocRef('circles', circleId);
+    batch.set(circleRef, circleState, { merge: true });
+
+    // 6b. Update each matched attendee's registration with their circleId
     for (const member of circleMembers) {
-      const existingReg = (await db.getRegistration(member.registrationId)) || {};
-      await db.saveRegistration(member.registrationId, {
-        ...existingReg,
-        circleId,
-        updatedAt: now,
-      });
+      const regRef = db.getDocRef('registrations', member.registrationId);
+      batch.set(regRef, { circleId, updatedAt: now }, { merge: true });
     }
 
-    // 8. Update Pending Pool and Group Partition State
-    await db.savePendingPool(city, venue, level, genderPref, eventDate, remainingPool);
-    await db.saveGroupState(city, venue, level, genderPref, eventDate, {
+    // 6c. Persist remaining pool (remove finalized members)
+    const poolDocId = db.getPoolDocId(city, venue, level, genderPref, eventDate);
+    const poolRef = db.getDocRef('pools', poolDocId);
+    batch.set(poolRef, { poolArray: remainingPool }, { merge: true });
+
+    // 6d. Update group partition state counter
+    const groupStateDocId = db.getGroupStateDocId(city, venue, level, genderPref, eventDate);
+    const groupStateRef = db.getDocRef('groupstate', groupStateDocId);
+    batch.set(groupStateRef, {
       activeCircleId: circleId,
       lastCircleCounter: nextIndex,
       updatedAt: now,
-    });
+    }, { merge: true });
+
+    // 6e. Commit all writes atomically
+    await batch.commit();
 
     return successResponse({
       circleId,

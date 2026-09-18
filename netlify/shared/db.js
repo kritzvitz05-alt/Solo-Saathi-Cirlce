@@ -11,7 +11,7 @@
  */
 
 const { getApps, initializeApp, cert } = require('firebase-admin/app');
-const { getFirestore } = require('firebase-admin/firestore');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const { OTP_VERIFIED_TTL_MINUTES } = require('./constants');
 
 // ---------------------------------------------------------------------------
@@ -62,6 +62,73 @@ function _slugify(str) {
  */
 function _compositeKey(...parts) {
   return parts.map(_slugify).join('_');
+}
+
+// =========================================================================
+// TRANSACTION, BATCH & REFERENCE HELPERS
+// =========================================================================
+
+/**
+ * Runs a Firestore Transaction. Firestore automatically retries up to 5 times
+ * on contention (optimistic concurrency). The `updateFn` receives a transaction
+ * object with `.get(docRef)` and `.set(docRef, data)` methods.
+ *
+ * @param {Function} updateFn - Async function receiving (transaction) as argument.
+ * @returns {Promise<*>} The return value of updateFn after successful commit.
+ */
+function runTransaction(updateFn) {
+  return db.runTransaction(updateFn);
+}
+
+/**
+ * Creates a Firestore WriteBatch for atomic multi-document writes.
+ * Callers use `batch.set()`, `batch.update()`, `batch.delete()`, then `batch.commit()`.
+ * Max 500 operations per batch.
+ *
+ * @returns {FirebaseFirestore.WriteBatch} A new WriteBatch instance.
+ */
+function runBatch() {
+  return db.batch();
+}
+
+/**
+ * Returns a Firestore DocumentReference for use inside transactions or batches.
+ *
+ * @param {string} collectionName - Firestore collection name.
+ * @param {string} docId - Document ID within the collection.
+ * @returns {FirebaseFirestore.DocumentReference} Document reference.
+ */
+function getDocRef(collectionName, docId) {
+  return db.collection(collectionName).doc(docId);
+}
+
+/**
+ * Builds the composite document ID for a pending pool document.
+ * Exposed so transaction callers can construct refs without duplicating slugify logic.
+ *
+ * @param {string} city
+ * @param {string} venue
+ * @param {string} level
+ * @param {string} genderPref
+ * @param {string} eventDate
+ * @returns {string} Composite document ID.
+ */
+function getPoolDocId(city, venue, level, genderPref, eventDate) {
+  return _compositeKey(city, venue, level, genderPref, eventDate);
+}
+
+/**
+ * Builds the composite document ID for a group state document.
+ *
+ * @param {string} city
+ * @param {string} venue
+ * @param {string} level
+ * @param {string} genderPref
+ * @param {string} date
+ * @returns {string} Composite document ID.
+ */
+function getGroupStateDocId(city, venue, level, genderPref, date) {
+  return _compositeKey(city, venue, level, genderPref, date);
 }
 
 /**
@@ -391,6 +458,14 @@ async function getVenues() {
 
 module.exports = {
   db,
+  FieldValue,
+  // Transaction & batch helpers
+  runTransaction,
+  runBatch,
+  getDocRef,
+  getPoolDocId,
+  getGroupStateDocId,
+  // Original 18 contract functions
   getRegistration,
   saveRegistration,
   getRegistrationsByMobile,

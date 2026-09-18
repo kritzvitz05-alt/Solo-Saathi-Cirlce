@@ -6,9 +6,12 @@
  * - 'grow': Any member opens 1-20 spots (GROW_MIN_SPOTS to GROW_MAX_SPOTS) and unlocks the circle.
  * - 'lock': Any member locks circle to prevent additional walk-ins.
  * - 'leave': Member departs circle, freeing their slot; auto-elects replacement captain if needed.
+ *     Uses a Firestore Transaction for atomic read-modify-write on circle + registration.
  * - 'transferCaptain': Captain transfers role to another roster member (with cancel support).
- * - 'showup': Physical attendee check-in at venue ground, updating venue showups list.
- * - 'switchCircle': Moves attendee to another circle:
+ * - 'showup': Physical attendee check-in at venue ground. Uses FieldValue.arrayUnion()
+ *     for atomic append without full transaction overhead.
+ * - 'switchCircle': Moves attendee to another circle using a Firestore Transaction
+ *     to atomically modify source circle, target circle, and registration:
  *   - Capped at 3 switches per night (SWITCH_CIRCLE_MAX_PER_NIGHT = 3).
  *   - Locked for first 5 minutes after joining (SWITCH_CIRCLE_LOCK_MINUTES = 5).
  *   - 20-minute cooldown between subsequent switches (SWITCH_CIRCLE_COOLDOWN_MINUTES = 20).
@@ -58,7 +61,7 @@ exports.handler = async (event, context) => {
 
   try {
     // -------------------------------------------------------------------------
-    // ACTION: SHOWUP (Venue gate check-in)
+    // ACTION: SHOWUP (Venue gate check-in) — Atomic via FieldValue.arrayUnion
     // -------------------------------------------------------------------------
     if (action === 'showup') {
       const { city, venue, gate } = body;
@@ -66,6 +69,7 @@ exports.handler = async (event, context) => {
         return errorResponse("Missing required parameters for 'showup': city, venue, registrationId.", 400);
       }
 
+      // Read existing showups to check for duplicates
       const showups = (await db.getShowups(city, venue)) || [];
       const alreadyCheckedIn = showups.some((s) => s.registrationId === registrationId);
 
@@ -84,13 +88,26 @@ exports.handler = async (event, context) => {
         gate: gate || 'Main Gate',
       };
 
-      showups.push(newCheckin);
-      await db.saveShowups(city, venue, showups);
+      // Atomic append using FieldValue.arrayUnion — no transaction needed.
+      // If two gate scanners fire at the same millisecond, both appends succeed
+      // without overwriting each other.
+      const showupDocId = db.getDocRef('showups',
+        db.getPoolDocId(city, venue, new Date(now + 5.5 * 60 * 60 * 1000).toISOString().split('T')[0])
+      );
+      // Use the existing _todayIST-based key via saveShowups path
+      // but with arrayUnion for atomicity
+      const todayIST = new Date(now + 5.5 * 60 * 60 * 1000).toISOString().split('T')[0];
+      const showupRef = db.getDocRef('showups',
+        [city, venue, todayIST].map(s => s.toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')).join('_')
+      );
+      await showupRef.set({
+        showupsArray: db.FieldValue.arrayUnion(newCheckin),
+      }, { merge: true });
 
       return successResponse({
         message: 'Attendee check-in recorded successfully.',
         checkedInAt: now,
-        totalShowups: showups.length,
+        totalShowups: showups.length + 1,
       });
     }
 
@@ -152,59 +169,80 @@ exports.handler = async (event, context) => {
     }
 
     // -------------------------------------------------------------------------
-    // ACTION: LEAVE (Member leaves circle)
+    // ACTION: LEAVE (Member leaves circle) — Transactional
     // -------------------------------------------------------------------------
     if (action === 'leave') {
       if (!registrationId) {
         return errorResponse("registrationId is required to leave a circle.", 400);
       }
 
-      const memberIndex = circle.members.findIndex((m) => m.registrationId === registrationId);
-      if (memberIndex === -1) {
-        return errorResponse("Attendee is not currently a member of this circle.", 404);
-      }
+      const circleRef = db.getDocRef('circles', circleId);
+      const regRef = db.getDocRef('registrations', registrationId);
 
-      const leavingMember = circle.members[memberIndex];
-      circle.members.splice(memberIndex, 1);
-      circle.totalCount = circle.members.length;
+      const result = await db.runTransaction(async (transaction) => {
+        // Read both documents atomically
+        const circleSnap = await transaction.get(circleRef);
+        const regSnap = await transaction.get(regRef);
 
-      if (leavingMember.gender === 'male') circle.maleCount = Math.max(0, (circle.maleCount || 1) - 1);
-      else if (leavingMember.gender === 'female') circle.femaleCount = Math.max(0, (circle.femaleCount || 1) - 1);
-      else circle.otherCount = Math.max(0, (circle.otherCount || 1) - 1);
-
-      // If the leaving member was the Captain, designate a replacement
-      let newCaptainName = null;
-      if (circle.captainId === registrationId) {
-        const replacement = circle.members.find((m) => m.captainOptIn) || circle.members[0];
-        if (replacement) {
-          circle.captainId = replacement.registrationId;
-          circle.captainName = replacement.name;
-          replacement.isCaptain = true;
-          newCaptainName = replacement.name;
-        } else {
-          circle.captainId = null;
-          circle.captainName = null;
+        if (!circleSnap.exists) {
+          throw new Error(`Circle '${circleId}' not found.`);
         }
-      }
 
-      circle.updatedAt = now;
-      await db.saveCircleState(circleId, circle);
+        const circleData = circleSnap.data();
+        const regData = regSnap.exists ? regSnap.data() : null;
 
-      // Clear circle association on registration
-      const reg = await db.getRegistration(registrationId);
-      if (reg) {
-        await db.saveRegistration(registrationId, {
-          ...reg,
-          circleId: null,
-          updatedAt: now,
-        });
-      }
+        const memberIndex = circleData.members.findIndex((m) => m.registrationId === registrationId);
+        if (memberIndex === -1) {
+          throw new Error("Attendee is not currently a member of this circle.");
+        }
+
+        const leavingMember = circleData.members[memberIndex];
+        circleData.members.splice(memberIndex, 1);
+        circleData.totalCount = circleData.members.length;
+
+        if (leavingMember.gender === 'male') circleData.maleCount = Math.max(0, (circleData.maleCount || 1) - 1);
+        else if (leavingMember.gender === 'female') circleData.femaleCount = Math.max(0, (circleData.femaleCount || 1) - 1);
+        else circleData.otherCount = Math.max(0, (circleData.otherCount || 1) - 1);
+
+        // If the leaving member was the Captain, designate a replacement
+        let newCaptainName = null;
+        if (circleData.captainId === registrationId) {
+          const replacement = circleData.members.find((m) => m.captainOptIn) || circleData.members[0];
+          if (replacement) {
+            circleData.captainId = replacement.registrationId;
+            circleData.captainName = replacement.name;
+            replacement.isCaptain = true;
+            newCaptainName = replacement.name;
+          } else {
+            circleData.captainId = null;
+            circleData.captainName = null;
+          }
+        }
+
+        circleData.updatedAt = now;
+
+        // Atomic writes
+        transaction.set(circleRef, circleData, { merge: true });
+
+        if (regData) {
+          transaction.set(regRef, {
+            ...regData,
+            circleId: null,
+            updatedAt: now,
+          }, { merge: true });
+        }
+
+        return {
+          remainingMembers: circleData.totalCount,
+          newCaptain: newCaptainName,
+        };
+      });
 
       return successResponse({
         message: 'Left circle successfully.',
         circleId,
-        remainingMembers: circle.totalCount,
-        newCaptain: newCaptainName,
+        remainingMembers: result.remainingMembers,
+        newCaptain: result.newCaptain,
       });
     }
 
@@ -248,7 +286,7 @@ exports.handler = async (event, context) => {
     }
 
     // -------------------------------------------------------------------------
-    // ACTION: SWITCH CIRCLE
+    // ACTION: SWITCH CIRCLE — Transactional
     // -------------------------------------------------------------------------
     if (action === 'switchCircle') {
       const { targetCircleId } = body;
@@ -260,126 +298,142 @@ exports.handler = async (event, context) => {
         return errorResponse("Attendee is already in target circle.", 400);
       }
 
-      // Member check in source circle
-      const memberIndex = circle.members.findIndex((m) => m.registrationId === registrationId);
-      if (memberIndex === -1) {
-        return errorResponse("Attendee is not currently in source circle.", 404);
-      }
-      const member = circle.members[memberIndex];
+      const sourceCircleRef = db.getDocRef('circles', circleId);
+      const targetCircleRef = db.getDocRef('circles', targetCircleId);
+      const regRef = db.getDocRef('registrations', registrationId);
 
-      // Fetch registration record to check switch limits and cooldowns
-      const reg = await db.getRegistration(registrationId);
-      const switchHistory = reg?.switchHistory || [];
+      const result = await db.runTransaction(async (transaction) => {
+        // Read all three documents atomically
+        const sourceSnap = await transaction.get(sourceCircleRef);
+        const targetSnap = await transaction.get(targetCircleRef);
+        const regSnap = await transaction.get(regRef);
 
-      // Rule 1: Max 3 switches per night
-      if (switchHistory.length >= SWITCH_CIRCLE_MAX_PER_NIGHT) {
-        return errorResponse(
-          `Maximum of ${SWITCH_CIRCLE_MAX_PER_NIGHT} circle switches reached for tonight.`,
-          403,
-          { switchesUsed: switchHistory.length, maxSwitches: SWITCH_CIRCLE_MAX_PER_NIGHT }
-        );
-      }
+        if (!sourceSnap.exists) {
+          throw new Error(`Source circle '${circleId}' not found.`);
+        }
+        if (!targetSnap.exists) {
+          throw new Error(`Target circle '${targetCircleId}' not found.`);
+        }
 
-      // Rule 2: Lock-in for first 5 minutes after joining
-      const joinedAt = member.joinedAt || circle.createdAt || now;
-      const minutesSinceJoin = (now - joinedAt) / 60000;
-      if (minutesSinceJoin < SWITCH_CIRCLE_LOCK_MINUTES) {
-        const waitMinutes = Math.ceil(SWITCH_CIRCLE_LOCK_MINUTES - minutesSinceJoin);
-        return errorResponse(
-          `New circle members cannot switch for the first ${SWITCH_CIRCLE_LOCK_MINUTES} minutes. Please wait ${waitMinutes} minute(s).`,
-          429,
-          { minutesRemaining: waitMinutes }
-        );
-      }
+        const sourceCircle = sourceSnap.data();
+        const targetCircle = targetSnap.data();
+        const reg = regSnap.exists ? regSnap.data() : null;
 
-      // Rule 3: 20-minute cooldown between subsequent switches
-      if (switchHistory.length > 0) {
-        const lastSwitchAt = switchHistory[switchHistory.length - 1].timestamp;
-        const minutesSinceLastSwitch = (now - lastSwitchAt) / 60000;
-        if (minutesSinceLastSwitch < SWITCH_CIRCLE_COOLDOWN_MINUTES) {
-          const waitMinutes = Math.ceil(SWITCH_CIRCLE_COOLDOWN_MINUTES - minutesSinceLastSwitch);
-          return errorResponse(
-            `Cooldown active. You must wait ${SWITCH_CIRCLE_COOLDOWN_MINUTES} minutes between switches. ${waitMinutes} minute(s) remaining.`,
-            429,
-            { cooldownRemainingMinutes: waitMinutes }
+        // Member check in source circle
+        const memberIndex = sourceCircle.members.findIndex((m) => m.registrationId === registrationId);
+        if (memberIndex === -1) {
+          throw new Error("Attendee is not currently in source circle.");
+        }
+        const member = sourceCircle.members[memberIndex];
+
+        // Switch limits and cooldowns from registration
+        const switchHistory = reg?.switchHistory || [];
+
+        // Rule 1: Max 3 switches per night
+        if (switchHistory.length >= SWITCH_CIRCLE_MAX_PER_NIGHT) {
+          throw new Error(
+            `Maximum of ${SWITCH_CIRCLE_MAX_PER_NIGHT} circle switches reached for tonight.`
           );
         }
-      }
 
-      // Target circle evaluation
-      const targetCircle = await db.getCircleState(targetCircleId);
-      if (!targetCircle) {
-        return errorResponse(`Target circle '${targetCircleId}' not found.`, 404);
-      }
+        // Rule 2: Lock-in for first 5 minutes after joining
+        const joinedAt = member.joinedAt || sourceCircle.createdAt || now;
+        const minutesSinceJoin = (now - joinedAt) / 60000;
+        if (minutesSinceJoin < SWITCH_CIRCLE_LOCK_MINUTES) {
+          const waitMinutes = Math.ceil(SWITCH_CIRCLE_LOCK_MINUTES - minutesSinceJoin);
+          throw new Error(
+            `New circle members cannot switch for the first ${SWITCH_CIRCLE_LOCK_MINUTES} minutes. Please wait ${waitMinutes} minute(s).`
+          );
+        }
 
-      if (targetCircle.isLocked || targetCircle.status === 'locked' || targetCircle.status === 'closed') {
-        return errorResponse("Target circle is currently locked to new members.", 403);
-      }
+        // Rule 3: 20-minute cooldown between subsequent switches
+        if (switchHistory.length > 0) {
+          const lastSwitchAt = switchHistory[switchHistory.length - 1].timestamp;
+          const minutesSinceLastSwitch = (now - lastSwitchAt) / 60000;
+          if (minutesSinceLastSwitch < SWITCH_CIRCLE_COOLDOWN_MINUTES) {
+            const waitMinutes = Math.ceil(SWITCH_CIRCLE_COOLDOWN_MINUTES - minutesSinceLastSwitch);
+            throw new Error(
+              `Cooldown active. You must wait ${SWITCH_CIRCLE_COOLDOWN_MINUTES} minutes between switches. ${waitMinutes} minute(s) remaining.`
+            );
+          }
+        }
 
-      if (targetCircle.totalCount >= (targetCircle.maxSpots || SOFT_MAX_GROUP)) {
-        return errorResponse("Target circle has reached capacity.", 403);
-      }
+        // Target circle validation
+        if (targetCircle.isLocked || targetCircle.status === 'locked' || targetCircle.status === 'closed') {
+          throw new Error("Target circle is currently locked to new members.");
+        }
 
-      // Gender cap evaluation on target circle
-      const genderViolated = checkGenderCap(
-        { male: targetCircle.maleCount, female: targetCircle.femaleCount },
-        member.gender,
-        targetCircle.isAllWomen
-      );
-      if (genderViolated) {
-        return errorResponse("Target circle has reached the gender balance limit for this group.", 403);
-      }
+        if (targetCircle.totalCount >= (targetCircle.maxSpots || SOFT_MAX_GROUP)) {
+          throw new Error("Target circle has reached capacity.");
+        }
 
-      // Execute transfer: remove from source
-      circle.members.splice(memberIndex, 1);
-      circle.totalCount = circle.members.length;
-      if (member.gender === 'male') circle.maleCount = Math.max(0, (circle.maleCount || 1) - 1);
-      else if (member.gender === 'female') circle.femaleCount = Math.max(0, (circle.femaleCount || 1) - 1);
-      else circle.otherCount = Math.max(0, (circle.otherCount || 1) - 1);
+        // Gender cap evaluation on target circle
+        const genderViolated = checkGenderCap(
+          { male: targetCircle.maleCount, female: targetCircle.femaleCount },
+          member.gender,
+          targetCircle.isAllWomen
+        );
+        if (genderViolated) {
+          throw new Error("Target circle has reached the gender balance limit for this group.");
+        }
 
-      if (circle.captainId === registrationId) {
-        const rep = circle.members.find((m) => m.captainOptIn) || circle.members[0];
-        circle.captainId = rep ? rep.registrationId : null;
-        circle.captainName = rep ? rep.name : null;
-        if (rep) rep.isCaptain = true;
-      }
-      circle.updatedAt = now;
-      await db.saveCircleState(circleId, circle);
+        // Execute transfer: remove from source
+        sourceCircle.members.splice(memberIndex, 1);
+        sourceCircle.totalCount = sourceCircle.members.length;
+        if (member.gender === 'male') sourceCircle.maleCount = Math.max(0, (sourceCircle.maleCount || 1) - 1);
+        else if (member.gender === 'female') sourceCircle.femaleCount = Math.max(0, (sourceCircle.femaleCount || 1) - 1);
+        else sourceCircle.otherCount = Math.max(0, (sourceCircle.otherCount || 1) - 1);
 
-      // Add to target
-      const transferredMember = {
-        ...member,
-        isCaptain: false,
-        joinedAt: now,
-      };
-      targetCircle.members.push(transferredMember);
-      targetCircle.totalCount = targetCircle.members.length;
-      if (member.gender === 'male') targetCircle.maleCount = (targetCircle.maleCount || 0) + 1;
-      else if (member.gender === 'female') targetCircle.femaleCount = (targetCircle.femaleCount || 0) + 1;
-      else targetCircle.otherCount = (targetCircle.otherCount || 0) + 1;
-      targetCircle.updatedAt = now;
-      await db.saveCircleState(targetCircleId, targetCircle);
+        if (sourceCircle.captainId === registrationId) {
+          const rep = sourceCircle.members.find((m) => m.captainOptIn) || sourceCircle.members[0];
+          sourceCircle.captainId = rep ? rep.registrationId : null;
+          sourceCircle.captainName = rep ? rep.name : null;
+          if (rep) rep.isCaptain = true;
+        }
+        sourceCircle.updatedAt = now;
 
-      // Update attendee registration with switch history
-      switchHistory.push({
-        fromCircleId: circleId,
-        toCircleId: targetCircleId,
-        timestamp: now,
-      });
+        // Add to target
+        const transferredMember = {
+          ...member,
+          isCaptain: false,
+          joinedAt: now,
+        };
+        targetCircle.members.push(transferredMember);
+        targetCircle.totalCount = targetCircle.members.length;
+        if (member.gender === 'male') targetCircle.maleCount = (targetCircle.maleCount || 0) + 1;
+        else if (member.gender === 'female') targetCircle.femaleCount = (targetCircle.femaleCount || 0) + 1;
+        else targetCircle.otherCount = (targetCircle.otherCount || 0) + 1;
+        targetCircle.updatedAt = now;
 
-      if (reg) {
-        await db.saveRegistration(registrationId, {
-          ...reg,
-          circleId: targetCircleId,
-          switchHistory,
-          updatedAt: now,
+        // Update switch history
+        switchHistory.push({
+          fromCircleId: circleId,
+          toCircleId: targetCircleId,
+          timestamp: now,
         });
-      }
+
+        // Atomic writes — all three documents updated together
+        transaction.set(sourceCircleRef, sourceCircle, { merge: true });
+        transaction.set(targetCircleRef, targetCircle, { merge: true });
+
+        if (reg) {
+          transaction.set(regRef, {
+            ...reg,
+            circleId: targetCircleId,
+            switchHistory,
+            updatedAt: now,
+          }, { merge: true });
+        }
+
+        return {
+          switchesRemaining: SWITCH_CIRCLE_MAX_PER_NIGHT - switchHistory.length,
+        };
+      });
 
       return successResponse({
         message: `Successfully switched from ${circleId} to ${targetCircleId}.`,
         newCircleId: targetCircleId,
-        switchesRemaining: SWITCH_CIRCLE_MAX_PER_NIGHT - switchHistory.length,
+        switchesRemaining: result.switchesRemaining,
       });
     }
 

@@ -28,5 +28,8 @@
   "dependencies": {
     "firebase-admin": "^14.4.0",
     "razorpay": "^2.9.5"
+  },
+  "devDependencies": {
+    "netlify-cli": "^27.8.0"
   }
 }

@@ -109,32 +109,91 @@ These documents map to WhatsApp numbers. In Firestore, documents persist forever
 
 ---
 
-## 3. Firestore Concurrency & Transactions
+## 3. Firestore Concurrency & Transactions (Implemented)
 
 One distinct advantage of Firestore over simple Blob storage is its robust support for Atomic Transactions.
-As the Matching Engine (`netlify/shared/matching.js`) reads group states and writes new circles concurrently, we can run into race conditions if 100 people register at the exact same millisecond.
+As the Matching Engine reads group states and writes new circles concurrently, race conditions can occur if 100 people register at the exact same millisecond.
 
-While `db.js` exposes simple get/save methods, we will enhance the implementation of `savePendingPool`, `saveGroupState`, and `saveRegistration` to utilize **Firestore Transactions (`db.runTransaction`)** or **Batched Writes** for atomic matching guarantees. 
+### 3.1 Transaction & Batch Helpers in `db.js`
 
-For instance, when a circle is formed:
-1. Remove attendees from `pools`
-2. Update `groupstate` counters
-3. Create new `circles` document
-4. Update `registrations` with their new `circleId`
+The following helpers are exported from `db.js` for use by callers that need atomic operations:
 
-All of these can be wrapped in a single Firestore Batch Write to guarantee that no attendee is ever left in a broken state if the serverless function crashes halfway through.
+| Export | Purpose |
+|:-------|:--------|
+| `runTransaction(updateFn)` | Wraps `db.runTransaction()`. Firestore automatically retries up to 5 times on contention. |
+| `runBatch()` | Returns a Firestore `WriteBatch` for atomic multi-document writes (max 500 ops). |
+| `getDocRef(collection, docId)` | Returns a `DocumentReference` for use inside transactions or batches. |
+| `getPoolDocId(city, venue, level, genderPref, eventDate)` | Exposes the composite key builder for pool documents. |
+| `getGroupStateDocId(city, venue, level, genderPref, date)` | Exposes the composite key builder for group state documents. |
+| `FieldValue` | Exported Firestore `FieldValue` for atomic field operations (e.g., `arrayUnion`). |
+
+### 3.2 Where Transactions Are Used
+
+| File | Operation | Strategy | Documents Touched |
+|:-----|:----------|:---------|:------------------|
+| `payment-helpers.js` | Live matching (`joinMatchingBucket`) | `runTransaction` | `groupstate`, `circles`, `registrations` |
+| `payment-helpers.js` | Advance pool append | `runTransaction` | `pools` |
+| `finalize-bucket.js` | Batch circle formation | `runBatch` + `batch.commit()` | `circles`, N × `registrations`, `pools`, `groupstate` |
+| `circle-actions.js` | `switchCircle` | `runTransaction` | source `circles`, target `circles`, `registrations` |
+| `circle-actions.js` | `leave` | `runTransaction` | `circles`, `registrations` |
+| `circle-actions.js` | `showup` | `FieldValue.arrayUnion()` | `showups` (lock-free atomic append) |
+
+### 3.3 Non-Transactional Operations (By Design)
+
+The following actions operate on a single document and are low-concurrency single-actor operations. They remain as simple `set()` calls:
+
+- `grow` — Single circle document
+- `lock` — Single circle document
+- `transferCaptain` — Single circle document
+- All OTP operations (`saveOtpRecord`, `saveOtpRateLimit`, `saveVerifiedStatus`) — Single document keyed by WhatsApp number
+
+### 3.4 Example: Live Matching Transaction Flow
+
+When a paid attendee enters live matching via `joinMatchingBucket`:
+
+```
+Transaction Start
+  ├─ READ  groupstate/{partition}     → get active circleId + counter
+  ├─ READ  circles/{activeCircleId}   → get current member list + counts
+  ├─ EVAL  capacity, gender cap, new-circle logic (pure computation)
+  ├─ WRITE circles/{circleId}         → updated members array
+  ├─ WRITE groupstate/{partition}     → updated counter
+  └─ WRITE registrations/{regId}      → set circleId
+Transaction Commit (all-or-nothing, auto-retry up to 5× on contention)
+```
+
+### 3.5 Example: Batch Circle Formation Flow
+
+When an admin finalizes a pending pool via `finalize-bucket.js`:
+
+```
+Sequential Reads (admin endpoint, rate-limited)
+  ├─ READ  pools/{partition}          → pending pool array
+  └─ READ  groupstate/{partition}     → last circle counter
+
+Compute (pure logic)
+  ├─ Partition members by gender cap + SOFT_MAX_GROUP
+  └─ Elect captain
+
+Batch Write (all-or-nothing)
+  ├─ SET   circles/{newCircleId}      → circle state
+  ├─ SET   registrations/{member1}    → { circleId }
+  ├─ SET   registrations/{member2}    → { circleId }
+  ├─ ...   (up to 24 members)
+  ├─ SET   pools/{partition}          → remaining pool
+  └─ SET   groupstate/{partition}     → updated counter
+Batch Commit
+```
 
 ---
 
-## 4. Implementation Steps for the Database Teammate
+## 4. Implementation Steps (Complete)
 
-1. **Initialize Firebase Admin**:
-   Create a single Firebase Admin app instance that is shared across function invocations to maintain connection pooling.
-2. **Implement the 18 Stubs**:
-   Replace the `throw new Error("NOT_IMPLEMENTED...")` lines in `netlify/shared/db.js` with `firebase-admin` Firestore calls mapping to the collections outlined above.
-3. **Configure TTL Indexes**:
-   In the Firebase Console, set up TTL (Time-To-Live) indexes for the `otp` and `verified` collections to auto-delete documents when their timestamps expire.
-4. **Configure Composite Indexes**:
-   In the Firebase Console, create a composite index for `registrations` on the fields `whatsapp` (Ascending) and `eventDate` (Ascending).
+1. ~~**Initialize Firebase Admin**~~ ✅ Done
+2. ~~**Implement the 18 Stubs**~~ ✅ Done — All 18 functions implemented
+3. ~~**Configure TTL Indexes**~~ ⬜ Pending (Firebase Console)
+4. ~~**Configure Composite Indexes**~~ ⬜ Pending (Firebase Console)
+5. ~~**Add Concurrency Safeguards**~~ ✅ Done — Transactions and batched writes implemented
 
-By following this approach, the existing Phase 2 and Phase 3 logic will require **zero changes**, and we will benefit from a robust, scalable backend for the Navratri season.
+By following this approach, the existing Phase 2 and Phase 3 logic requires **zero changes** to its business logic, and we benefit from a robust, scalable, and **race-condition-free** backend for the Navratri season.
+

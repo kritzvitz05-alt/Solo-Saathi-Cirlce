@@ -12,6 +12,9 @@
     "packageJson": {
       "dependencies": [
         "npm:firebase-admin@^14.4.0",
+database-setup
+        "npm:netlify-cli@^27.8.0",
+main
         "npm:razorpay@^2.9.5"
       ]
     }

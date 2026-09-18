@@ -6,6 +6,11 @@
  * - `joinMatchingBucket`: Decoupled matching engine entry point called only AFTER payment
  *   confirmation (used by both verify-payment.js and webhook.js). Idempotent to prevent
  *   duplicate circle allocations or pool duplicates on webhook retries or concurrent calls.
+ *
+ *   CONCURRENCY: Both live and advance paths use Firestore Transactions
+ *   (`db.runTransaction`) to guarantee atomic read-modify-write cycles. Firestore
+ *   automatically retries up to 5 times on contention.
+ *
  * - `maskSecret`: Security utility masking all but the last 4 characters of sensitive keys
  *   in debug and failure logs.
  */
@@ -37,6 +42,9 @@ function maskSecret(secret) {
  * - For Advance registrations: checks if the registration ID already exists in the pending pool;
  *   if so, returns existing pool state without creating duplicates.
  *
+ * CONCURRENCY: Uses Firestore Transactions for atomic read-modify-write to prevent
+ * race conditions during high-traffic walk-up times.
+ *
  * @param {Object} registration - Confirmed registration document from Firestore.
  * @returns {Promise<Object>} Assignment result payload containing matching metadata.
  */
@@ -54,7 +62,7 @@ async function joinMatchingBucket(registration) {
   const venue = registration.venue;
 
   // -------------------------------------------------------------------------
-  // 1. LIVE REGISTRATION MATCHING
+  // 1. LIVE REGISTRATION MATCHING (Transactional)
   // -------------------------------------------------------------------------
   if (registrationType === 'live') {
     // Idempotency: If circle is already assigned, fetch and return current state
@@ -78,190 +86,199 @@ async function joinMatchingBucket(registration) {
       }
     }
 
-    // Fetch existing live partition state for tonight
-    let groupState = await db.getGroupState(
-      city,
-      venue,
-      level,
-      genderPref,
-      eventDate
-    );
+    // Build document references for the transaction
+    const groupStateDocId = db.getGroupStateDocId(city, venue, level, genderPref, eventDate);
+    const groupStateRef = db.getDocRef('groupstate', groupStateDocId);
+    const registrationRef = db.getDocRef('registrations', registration.id);
 
-    let activeCircleId = groupState?.activeCircleId || null;
-    let circleCounter = groupState?.lastCircleCounter || 0;
-    let circleState = null;
+    // Run the entire read-evaluate-write matching cycle inside a transaction
+    const result = await db.runTransaction(async (transaction) => {
+      // 1a. Read group state atomically
+      const groupStateSnap = await transaction.get(groupStateRef);
+      const groupState = groupStateSnap.exists ? groupStateSnap.data() : {};
 
-    if (activeCircleId) {
-      circleState = await db.getCircleState(activeCircleId);
-    }
+      let activeCircleId = groupState.activeCircleId || null;
+      let circleCounter = groupState.lastCircleCounter || 0;
+      let circleState = null;
 
-    // Determine if we need to start a brand new circle
-    let needNewCircle = false;
-    if (!circleState || circleState.status === 'locked' || circleState.status === 'closed') {
-      needNewCircle = true;
-    } else {
-      if (shouldStartNewBucket(circleState)) {
-        needNewCircle = true;
+      // 1b. Read active circle state atomically (if one exists)
+      if (activeCircleId) {
+        const circleRef = db.getDocRef('circles', activeCircleId);
+        const circleSnap = await transaction.get(circleRef);
+        circleState = circleSnap.exists ? circleSnap.data() : null;
       }
-      const genderViolated = checkGenderCap(
-        { male: circleState.maleCount, female: circleState.femaleCount },
-        registration.gender,
-        registration.allWomenToggle
-      );
-      if (genderViolated) {
+
+      // 1c. Determine if we need a new circle (pure computation, no DB calls)
+      let needNewCircle = false;
+      if (!circleState || circleState.status === 'locked' || circleState.status === 'closed') {
         needNewCircle = true;
+      } else {
+        if (shouldStartNewBucket(circleState)) {
+          needNewCircle = true;
+        }
+        const genderViolated = checkGenderCap(
+          { male: circleState.maleCount, female: circleState.femaleCount },
+          registration.gender,
+          registration.allWomenToggle
+        );
+        if (genderViolated) {
+          needNewCircle = true;
+        }
       }
-    }
 
-    if (needNewCircle) {
-      circleCounter += 1;
-      activeCircleId = buildCircleId(level, genderPref, circleCounter);
-      circleState = {
-        circleId: activeCircleId,
-        name: `${activeCircleId.replace('-', ' ')}`,
-        skillLevel: level,
-        isAllWomen: Boolean(registration.allWomenToggle),
-        city,
-        venue,
-        eventDate,
-        captainId: null,
-        captainName: null,
-        meetingPoint: 'Near Main Festival Entrance / Information Desk',
-        chatLink: `https://chat.whatsapp.com/demo_${activeCircleId.toLowerCase()}`,
-        members: [],
-        maleCount: 0,
-        femaleCount: 0,
-        otherCount: 0,
-        totalCount: 0,
-        status: 'active',
-        isLocked: false,
-        createdAt: now,
-      };
-    }
+      if (needNewCircle) {
+        circleCounter += 1;
+        activeCircleId = buildCircleId(level, genderPref, circleCounter);
+        circleState = {
+          circleId: activeCircleId,
+          name: `${activeCircleId.replace('-', ' ')}`,
+          skillLevel: level,
+          isAllWomen: Boolean(registration.allWomenToggle),
+          city,
+          venue,
+          eventDate,
+          captainId: null,
+          captainName: null,
+          meetingPoint: 'Near Main Festival Entrance / Information Desk',
+          chatLink: `https://chat.whatsapp.com/demo_${activeCircleId.toLowerCase()}`,
+          members: [],
+          maleCount: 0,
+          femaleCount: 0,
+          otherCount: 0,
+          totalCount: 0,
+          status: 'active',
+          isLocked: false,
+          createdAt: now,
+        };
+      }
 
-    // Evaluate Circle Captain assignment
-    let isCaptain = false;
-    if (registration.captainOptIn && !circleState.captainId) {
-      isCaptain = true;
-      circleState.captainId = registration.id;
-      circleState.captainName = registration.name;
-    }
-
-    // Add attendee to circle member roster
-    const newMember = {
-      registrationId: registration.id,
-      name: registration.name,
-      gender: registration.gender,
-      ageBand: registration.ageBand,
-      skillLevel: registration.skillLevel,
-      captainOptIn: Boolean(registration.captainOptIn),
-      isCaptain,
-      joinedAt: now,
-    };
-
-    circleState.members.push(newMember);
-    circleState.totalCount = circleState.members.length;
-    if (registration.gender === 'male') {
-      circleState.maleCount = (circleState.maleCount || 0) + 1;
-    } else if (registration.gender === 'female') {
-      circleState.femaleCount = (circleState.femaleCount || 0) + 1;
-    } else {
-      circleState.otherCount = (circleState.otherCount || 0) + 1;
-    }
-
-    // Fallback captain assignment
-    if (!circleState.captainId && circleState.members.length > 0) {
-      circleState.captainId = circleState.members[0].registrationId;
-      circleState.captainName = circleState.members[0].name;
-      circleState.members[0].isCaptain = true;
-      if (circleState.members[0].registrationId === registration.id) {
+      // 1d. Captain assignment
+      let isCaptain = false;
+      if (registration.captainOptIn && !circleState.captainId) {
         isCaptain = true;
+        circleState.captainId = registration.id;
+        circleState.captainName = registration.name;
       }
-    }
 
-    // Persist circle state, group partition counter, and updated registration
-    await db.saveCircleState(activeCircleId, circleState);
-    await db.saveGroupState(city, venue, level, genderPref, eventDate, {
-      activeCircleId,
-      lastCircleCounter: circleCounter,
-      updatedAt: now,
+      // 1e. Add attendee to circle member roster
+      const newMember = {
+        registrationId: registration.id,
+        name: registration.name,
+        gender: registration.gender,
+        ageBand: registration.ageBand,
+        skillLevel: registration.skillLevel,
+        captainOptIn: Boolean(registration.captainOptIn),
+        isCaptain,
+        joinedAt: now,
+      };
+
+      circleState.members.push(newMember);
+      circleState.totalCount = circleState.members.length;
+      if (registration.gender === 'male') {
+        circleState.maleCount = (circleState.maleCount || 0) + 1;
+      } else if (registration.gender === 'female') {
+        circleState.femaleCount = (circleState.femaleCount || 0) + 1;
+      } else {
+        circleState.otherCount = (circleState.otherCount || 0) + 1;
+      }
+
+      // Fallback captain assignment
+      if (!circleState.captainId && circleState.members.length > 0) {
+        circleState.captainId = circleState.members[0].registrationId;
+        circleState.captainName = circleState.members[0].name;
+        circleState.members[0].isCaptain = true;
+        if (circleState.members[0].registrationId === registration.id) {
+          isCaptain = true;
+        }
+      }
+
+      // 1f. Atomic writes — all succeed or none do
+      const circleRef = db.getDocRef('circles', activeCircleId);
+      transaction.set(circleRef, circleState, { merge: true });
+
+      transaction.set(groupStateRef, {
+        activeCircleId,
+        lastCircleCounter: circleCounter,
+        updatedAt: now,
+      }, { merge: true });
+
+      const updatedRegistration = { ...registration, circleId: activeCircleId };
+      transaction.set(registrationRef, updatedRegistration, { merge: true });
+
+      return {
+        success: true,
+        type: 'live',
+        circleId: activeCircleId,
+        circle: {
+          id: activeCircleId,
+          name: circleState.name,
+          meetingPoint: circleState.meetingPoint,
+          chatLink: circleState.chatLink,
+          isCaptain,
+          totalMembers: circleState.totalCount,
+        },
+        alreadyJoined: false,
+      };
     });
 
-    registration.circleId = activeCircleId;
-    await db.saveRegistration(registration.id, registration);
-
-    return {
-      success: true,
-      type: 'live',
-      circleId: activeCircleId,
-      circle: {
-        id: activeCircleId,
-        name: circleState.name,
-        meetingPoint: circleState.meetingPoint,
-        chatLink: circleState.chatLink,
-        isCaptain,
-        totalMembers: circleState.totalCount,
-      },
-      alreadyJoined: false,
-    };
+    return result;
   }
 
   // -------------------------------------------------------------------------
-  // 2. ADVANCE REGISTRATION MATCHING (BATCH POOL QUEUE)
+  // 2. ADVANCE REGISTRATION MATCHING (Transactional Pool Queue)
   // -------------------------------------------------------------------------
   if (registrationType === 'advance') {
-    const currentPool = (await db.getPendingPool(
-      city,
-      venue,
-      level,
-      genderPref,
-      eventDate
-    )) || [];
+    const poolDocId = db.getPoolDocId(city, venue, level, genderPref, eventDate);
+    const poolRef = db.getDocRef('pools', poolDocId);
 
-    // Idempotency: Check if attendee is already in the pending pool
-    const alreadyInPool = currentPool.some(
-      (item) => item.registrationId === registration.id
-    );
+    const result = await db.runTransaction(async (transaction) => {
+      // 2a. Read pool atomically
+      const poolSnap = await transaction.get(poolRef);
+      const currentPool = poolSnap.exists ? (poolSnap.data().poolArray || []) : [];
 
-    if (alreadyInPool) {
+      // 2b. Idempotency: check if attendee is already in the pool
+      const alreadyInPool = currentPool.some(
+        (item) => item.registrationId === registration.id
+      );
+
+      if (alreadyInPool) {
+        return {
+          success: true,
+          type: 'advance',
+          eventDate,
+          poolSize: currentPool.length,
+          alreadyJoined: true,
+        };
+      }
+
+      // 2c. Append new pool item
+      const poolItem = {
+        registrationId: registration.id,
+        name: registration.name,
+        whatsapp: registration.whatsapp,
+        gender: registration.gender,
+        ageBand: registration.ageBand,
+        skillLevel: registration.skillLevel,
+        allWomenToggle: Boolean(registration.allWomenToggle),
+        captainOptIn: Boolean(registration.captainOptIn),
+        joinedPoolAt: now,
+      };
+
+      currentPool.push(poolItem);
+
+      // 2d. Atomic write
+      transaction.set(poolRef, { poolArray: currentPool }, { merge: true });
+
       return {
         success: true,
         type: 'advance',
         eventDate,
         poolSize: currentPool.length,
-        alreadyJoined: true,
+        alreadyJoined: false,
       };
-    }
+    });
 
-    const poolItem = {
-      registrationId: registration.id,
-      name: registration.name,
-      whatsapp: registration.whatsapp,
-      gender: registration.gender,
-      ageBand: registration.ageBand,
-      skillLevel: registration.skillLevel,
-      allWomenToggle: Boolean(registration.allWomenToggle),
-      captainOptIn: Boolean(registration.captainOptIn),
-      joinedPoolAt: now,
-    };
-
-    currentPool.push(poolItem);
-    await db.savePendingPool(
-      city,
-      venue,
-      level,
-      genderPref,
-      eventDate,
-      currentPool
-    );
-
-    return {
-      success: true,
-      type: 'advance',
-      eventDate,
-      poolSize: currentPool.length,
-      alreadyJoined: false,
-    };
+    return result;
   }
 
   throw new Error(`[joinMatchingBucket] Unknown registrationType: '${registrationType}'`);
